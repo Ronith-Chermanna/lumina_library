@@ -1,0 +1,119 @@
+# ─────────────────────────────────────────────────────────────
+# LuminaLib — Docker Compose Orchestration
+# One command to rule them all:  docker-compose up --build
+# ─────────────────────────────────────────────────────────────
+
+version: "3.9"
+
+services:
+  # ── PostgreSQL Database ─────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    container_name: luminalib-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-luminalib}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-luminalib_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-luminalib}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U luminalib"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── Redis (Celery broker / caching) ─────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: luminalib-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Ollama (Local LLM — Llama 3)
+  ollama:
+    image: ollama/ollama:latest
+    container_name: luminalib-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    # Pull the model on first run (comment out if hardware-limited)
+    entrypoint: >
+      /bin/sh -c "
+        ollama serve &
+        SERVER_PID=$$! &&
+        sleep 10 &&
+        ollama pull llama3 ;
+        wait $$SERVER_PID
+      "
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+
+  # LuminaLib API
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: luminalib-api
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8000}:8000"
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-luminalib}:${POSTGRES_PASSWORD:-luminalib_secret}@db:5432/${POSTGRES_DB:-luminalib}
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      OLLAMA_BASE_URL: http://ollama:11434
+    volumes:
+      - book_storage:/app/storage/books
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Celery Worker (optional — for heavy workloads)
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: luminalib-worker
+    restart: unless-stopped
+    command: ["celery", "-A", "app.tasks.celery_app", "worker", "--loglevel=info"]
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-luminalib}:${POSTGRES_PASSWORD:-luminalib_secret}@db:5432/${POSTGRES_DB:-luminalib}
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      OLLAMA_BASE_URL: http://ollama:11434
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  ollama_data:
+  book_storage:
